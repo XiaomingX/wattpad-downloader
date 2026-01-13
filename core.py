@@ -9,8 +9,6 @@ import backoff
 from eliot import to_file, start_action
 from eliot.stdlib import EliotHandler
 from dotenv import load_dotenv
-from ebooklib import epub
-from ebooklib.epub import EpubBook
 from bs4 import BeautifulSoup
 from pydantic import TypeAdapter, model_validator, field_validator
 from pydantic_settings import BaseSettings
@@ -21,8 +19,6 @@ from aiohttp_client_cache import FileBackend, RedisBackend
 load_dotenv(override=True)
 
 handler = EliotHandler()
-logging.getLogger("fastapi").setLevel(logging.INFO)
-logging.getLogger("fastapi").addHandler(handler)
 
 if environ.get("DEBUG"):
     to_file(open("eliot.log", "wb"))
@@ -138,7 +134,7 @@ async def wp_get_cookies(username: str, password: str) -> dict:
         dict: Authorization cookies.
     """
     with start_action(action_type="api_fetch_cookies"):
-        async with CachedSession(headers=headers, cache=None) as session:
+        async with CachedSession(headers=headers, cache=None, trust_env=True) as session:
             async with session.post(
                 "https://www.wattpad.com/auth/login?nextUrl=%2F&_data=routes%2Fauth.login",
                 data={
@@ -200,63 +196,139 @@ story_ta = TypeAdapter(Story)
 
 @backoff.on_exception(backoff.expo, ClientResponseError, max_time=15)
 async def fetch_story_from_partId(
-    part_id: int, cookies: Optional[dict] = None
+    part_id: int, cookies: Optional[dict] = None, session: Optional[CachedSession] = None
 ) -> Tuple[str, Story]:
     """Return a Story ID from a Part ID."""
     with start_action(action_type="api_fetch_storyFromPartId"):
+        if session:
+            async with session.get(
+                f"https://www.wattpad.com/api/v3/story_parts/{part_id}?fields=groupId,group(tags,id,title,createDate,modifyDate,language(name),description,completed,mature,url,isPaywalled,user(username),parts(id,title),cover)"
+            ) as response:
+                response.raise_for_status()
+                body = await response.json()
+            return str(body["groupId"]), story_ta.validate_python(body["group"])
+        
         async with CachedSession(
-            headers=headers, cache=None if cookies else cache
+            headers=headers, cache=None if cookies else cache, trust_env=True
         ) as session:  # Don't cache requests with Cookies.
             async with session.get(
                 f"https://www.wattpad.com/api/v3/story_parts/{part_id}?fields=groupId,group(tags,id,title,createDate,modifyDate,language(name),description,completed,mature,url,isPaywalled,user(username),parts(id,title),cover)"
             ) as response:
                 response.raise_for_status()
-
                 body = await response.json()
-
         return str(body["groupId"]), story_ta.validate_python(body["group"])
 
 
 @backoff.on_exception(backoff.expo, ClientResponseError, max_time=15)
-async def retrieve_story(story_id: int, cookies: Optional[dict] = None) -> Story:
+async def retrieve_story(story_id: int, cookies: Optional[dict] = None, session: Optional[CachedSession] = None) -> Story:
     """Taking a story_id, return its information from the Wattpad API."""
     with start_action(action_type="api_fetch_story", story_id=story_id):
+        if session:
+            async with session.get(
+                f"https://www.wattpad.com/api/v3/stories/{story_id}?fields=tags,id,title,createDate,modifyDate,language(name),description,completed,mature,url,isPaywalled,user(username),parts(id,title),cover"
+            ) as response:
+                response.raise_for_status()
+                body = await response.json()
+            return story_ta.validate_python(body)
+
         async with CachedSession(
-            headers=headers, cookies=cookies, cache=None if cookies else cache
+            headers=headers, cookies=cookies, cache=None if cookies else cache, trust_env=True
         ) as session:
             async with session.get(
                 f"https://www.wattpad.com/api/v3/stories/{story_id}?fields=tags,id,title,createDate,modifyDate,language(name),description,completed,mature,url,isPaywalled,user(username),parts(id,title),cover"
             ) as response:
                 response.raise_for_status()
-
                 body = await response.json()
-
         return story_ta.validate_python(body)
 
 
 @backoff.on_exception(backoff.expo, ClientResponseError, max_time=15)
-async def fetch_part_content(part_id: int, cookies: Optional[dict] = None) -> str:
-    """Return the HTML Content of a Part."""
+async def fetch_part_content(part_id: int, cookies: Optional[dict] = None, session: Optional[CachedSession] = None) -> str:
+    """Return the HTML Content of a Part, handling pagination."""
+    all_content = []
+    page = 1
+    
     with start_action(action_type="api_fetch_partContent", part_id=part_id):
+        if session:
+            while True:
+                url = f"https://www.wattpad.com/apiv2/?m=storytext&id={part_id}"
+                if page > 1:
+                    url += f"&page={page}"
+                async with session.get(url) as response:
+                    if response.status == 404: break
+                    response.raise_for_status()
+                    body = await response.text()
+                    if not body or body.strip() == "" or body in all_content: break
+                    all_content.append(body)
+                    if len(body) < 10: break
+                    page += 1
+                    if page > 50: break
+            combined_html = "".join(all_content)
+            return clean_content(combined_html)
+
         async with CachedSession(
-            headers=headers, cookies=cookies, cache=None if cookies else cache
+            headers=headers, cookies=cookies, cache=None if cookies else cache, trust_env=True
         ) as session:
-            async with session.get(
-                f"https://www.wattpad.com/apiv2/?m=storytext&id={part_id}"
-            ) as response:
-                response.raise_for_status()
+            while True:
+                url = f"https://www.wattpad.com/apiv2/?m=storytext&id={part_id}"
+                if page > 1:
+                    url += f"&page={page}"
+                
+                async with session.get(url) as response:
+                    if response.status == 404:
+                        break
+                    response.raise_for_status()
+                    body = await response.text()
+                    
+                    if not body or body.strip() == "":
+                        break
+                    
+                    # Simple check for duplicates if the API doesn't 404 on out-of-bounds
+                    if body in all_content:
+                        break
+                        
+                    all_content.append(body)
+                    
+                    # Some versions of the API don't 404, they just return empty or same
+                    # Let's try to find if there's more. 
+                    # If the content length is very small, it might be the end.
+                    if len(body) < 10: # Arbitrary small number
+                        break
+                        
+                    page += 1
+                    if page > 50: # Safety limit
+                        break
 
-                body = await response.text()
+        combined_html = "".join(all_content)
+        return clean_content(combined_html)
 
-        return body
+
+def clean_content(html: str) -> str:
+    """Clean unwanted HTML tags and convert to plain text."""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "iframe", "noscript", "meta", "link"]):
+        tag.decompose()
+    
+    # Replace <p> and <br> with newlines to preserve structure in TXT
+    for p in soup.find_all("p"):
+        p.append("\n")
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+        
+    return soup.get_text(separator="\n", strip=True)
 
 
 @backoff.on_exception(backoff.expo, ClientResponseError, max_time=15)
-async def fetch_cover(url: str) -> bytes:
+async def fetch_cover(url: str, session: Optional[CachedSession] = None) -> bytes:
     """Fetch cover image bytes."""
     with start_action(action_type="api_fetch_cover", url=url):
+        if session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                return await response.read()
+
         async with CachedSession(
-            headers=headers, cache=None
+            headers=headers, cache=None, trust_env=True
         ) as session:  # Don't cache images.
             async with session.get(url) as response:
                 response.raise_for_status()
@@ -266,96 +338,32 @@ async def fetch_cover(url: str) -> bytes:
         return body
 
 
-# --- EPUB Generation --- #
+# --- TXT Generation Utilities --- #
+
+def get_metadata_text(data: Story) -> str:
+    """Generate a plain text summary of book metadata."""
+    lines = [
+        f"Title: {data['title']}",
+        f"Author: {data['user']['username']}",
+        f"Language: {data['language']['name']}",
+        f"Created: {data['createDate']}",
+        f"Modified: {data['modifyDate']}",
+        f"Completed: {data['completed']}",
+        f"Mature: {data['mature']}",
+        f"Tags: {', '.join(data['tags'])}",
+        f"URL: {data['url']}",
+        "\n--- Description ---\n",
+        data['description'],
+        "\n" + "="*20 + "\n"
+    ]
+    return "\n".join(lines)
 
 
-def set_metadata(book: EpubBook, data: Story) -> None:
-    """Set book metadata."""
-    book.add_author(data["user"]["username"])
-
-    book.add_metadata("DC", "title", data["title"])
-    book.add_metadata("DC", "description", data["description"])
-    book.add_metadata("DC", "date", data["createDate"])
-    book.add_metadata("DC", "modified", data["modifyDate"])
-    book.add_metadata("DC", "language", data["language"]["name"])
-
-    book.add_metadata(
-        None, "meta", "", {"name": "tags", "content": ", ".join(data["tags"])}
-    )
-    book.add_metadata(
-        None, "meta", "", {"name": "mature", "content": str(int(data["mature"]))}
-    )
-    book.add_metadata(
-        None, "meta", "", {"name": "completed", "content": str(int(data["completed"]))}
-    )
-
-
-async def set_cover(book: EpubBook, data: Story) -> None:
-    """Set book cover."""
-    book.set_cover("cover.jpg", await fetch_cover(data["cover"]))
-    chapter = epub.EpubHtml(
-        file_name="titlepage.xhtml",  # Standard for cover page
-    )
-    chapter.set_content('<img src="cover.jpg">')
-
-
-async def add_chapters(
-    book: EpubBook,
-    data: Story,
-    download_images: bool = False,
+async def download_chapter(
+    part: Part,
     cookies: Optional[dict] = None,
-):
-    chapters = []
-
-    for cidx, part in enumerate(data["parts"]):
-        content = await fetch_part_content(part["id"], cookies=cookies)
-        title = part["title"]
-
-        # Thanks https://eu17.proxysite.com/process.php?d=5VyWYcoQl%2BVF0BYOuOavtvjOloFUZz2BJ%2Fepiusk6Nz7PV%2B9i8rs7cFviGftrBNll%2B0a3qO7UiDkTt4qwCa0fDES&b=1
-        chapter = epub.EpubHtml(
-            title=title,
-            file_name=f"{cidx}.xhtml",  # Used to be clean_title.xhtml, but that broke Arabic support as slugify turns arabic strings into '', leading to multiple files with the same name, breaking those chapters.
-            lang=data["language"]["name"],
-        )
-
-        if download_images:
-            soup = BeautifulSoup(content, "lxml")
-
-            async with CachedSession(
-                headers=headers, cache=None
-            ) as session:  # Don't cache images.
-                for idx, image in enumerate(soup.find_all("img")):
-                    if not image["src"]:
-                        continue
-                    # Find all image tags and filter for those with sources
-
-                    async with session.get(image["src"]) as response:
-                        img = epub.EpubImage(
-                            media_type="image/jpeg",
-                            content=await response.read(),
-                            file_name=f"static/{cidx}/{idx}.jpeg",
-                        )
-                        book.add_item(img)
-                        # Fetch image and pack
-
-                        content = content.replace(
-                            str(image["src"]), f"static/{cidx}/{idx}.jpeg"
-                        )
-
-        chapter.set_content(f"<h1>{title}</h1>" + content)
-
-        chapters.append(chapter)
-
-        yield title  # Yield the chapter's title upon insertion preceeded by retrieval.
-
-    for chapter in chapters:
-        book.add_item(chapter)
-
-    book.toc = chapters
-
-    # Thanks https://github.com/aerkalov/ebooklib/blob/master/samples/09_create_image/create.py
-    book.add_item(epub.EpubNcx())
-    book.add_item(epub.EpubNav())
-
-    # create spine
-    book.spine = ["nav"] + chapters
+    session: Optional[CachedSession] = None,
+) -> str:
+    """Download and clean a single chapter."""
+    content = await fetch_part_content(part["id"], cookies=cookies, session=session)
+    return f"{part['title']}\n\n{content}"

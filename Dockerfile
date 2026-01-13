@@ -1,29 +1,33 @@
-FROM node:20
+FROM python:3.11-slim
 
-WORKDIR /build
-COPY src/frontend/package*.json .
-RUN rm -rf node_modules
-RUN rm -rf build
-RUN npm install
-COPY src/frontend/. .
-RUN npm run build
-# Thanks https://stackoverflow.com/q/76988450
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
-FROM python:3.10-slim
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
 
-# Install git
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+# Enable bytecode compilation
+ENV UV_COMPILE_BYTECODE=1
 
-COPY src/api/requirements.txt requirements.txt
-RUN pip3 install -r requirements.txt
-COPY --from=0 /build/build /app/build
-# COPY src/api/src/.env .env
-COPY src/api/src .
+# Copy dependency files
+COPY pyproject.toml .
 
-EXPOSE 80
-# ENV PORT=80
+# Install dependencies (without lock file for now, or I'll generate it)
+RUN uv sync --no-install-project
 
-CMD [ "python3", "main.py"]
+# Copy source code
+COPY core.py .
+COPY app.py .
 
+# Create downloads directory
+RUN mkdir downloads
+
+# Expose Chainlit port
+EXPOSE 8000
+
+# Run chainlit
+CMD ["uv", "run", "chainlit", "run", "app.py", "--host", "0.0.0.0", "--port", "8000"]
